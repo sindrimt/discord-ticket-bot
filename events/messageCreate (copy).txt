@@ -1,0 +1,398 @@
+import dotenv from "dotenv";
+dotenv.config();
+import axios from "axios";
+
+//import { Events, MessageEmbed } from 'discord.js';
+
+import pkg from "discord.js";
+const { Events, EmbedBuilder } = pkg;
+
+import { interact } from "../utils/dialogapi.js";
+import startConversationWithIntercom from "../utils/startConversationWithIntercom.js";
+import websocketStore from "../utils/webSocketStore.js";
+import { isTicketChannel } from "../utils/ticketUtils.js";
+
+import WebSocket from "ws";
+
+
+const channelTimers = {};
+
+const setChannelTimer = (channelId, guild, minutes) => {
+  console.log("timer", minutes)
+  // Clear existing timer if it exists
+  if (channelTimers[channelId]) {
+    clearTimeout(channelTimers[channelId]);
+  }
+
+  // Set a new timer
+  channelTimers[channelId] = setTimeout(() => {
+    const fetchedChannel = guild.channels.cache.get(channelId);
+    if (fetchedChannel) {
+      fetchedChannel.delete();
+    }
+    // Remove the timer from the global object
+    delete channelTimers[channelId];
+  }, minutes * 60 * 1000 /* x minutes */);
+}
+
+const talkToHuman = (message) => {
+  isTicketChannel(message.channel)
+    .then(async (inTicket) => {
+      if (inTicket) {
+        const messages = await message.channel.messages.fetch();
+
+        // Ping the server (Maybe not needed but eh)
+        await axios.head("https://funding-pips-live-agent.onrender.com/intercom");
+
+        // Create a intercom conversation
+        startConversationWithIntercom(message.author.id, messages)
+          .then(({ userID, conversationID }) => {
+            console.log("starting websocket");
+
+            // Create a websocket to the server with the conversation ID and userID gotten from the
+            // initialization from the intercom conversation
+            const ws = new WebSocket(`https://funding-pips-live-agent.onrender.com/intercom/user/${userID}/conversation/${conversationID}/socket`);
+
+            // Catch event when the websocket opens
+            ws.on("open", async () => {
+              console.log("WebSocket connection opened.");
+              websocketStore.set(message.channel.id, ws);
+              setChannelTimer(message.channel.id, message.guild, 90);
+              const embed = new EmbedBuilder()
+                .setAuthor({ name: 'Funding Pips Ticket support', iconURL: 'https://s3-eu-west-1.amazonaws.com/tpd/logos/634a4940f5023fc9ea219434/0x0.png', url: 'https://fundingpips.com/' })
+                .setTitle("Your message is sent to one of our agents")
+                .setDescription("We will respond to you as quickly as possible")
+                .setColor("#334AFA");
+              message.channel.send({ embeds: [embed] });
+            });
+
+            // Catch the event when a message comes from intercom
+            ws.on("message", async (data) => {
+              const event = JSON.parse(data);
+
+              if (event.type.startsWith("live_agent")) {
+
+                if (!event.data.conversation) {
+                  console.log("NOT A conversation")
+                  console.log(event)
+                  if (event?.data?.message) {
+                    message.channel.send(event.data.message);
+                  }
+                } else {
+                  console.log("A CONVERSATION!!!")
+                  const attachmentUrls = event.data.conversation.conversation_parts.conversation_parts[0].attachments;
+
+                  console.log("HERE=============");
+
+                  if (attachmentUrls) {
+                    attachmentUrls.map((url) => {
+                      message.channel.send(url.url);
+                    });
+                  }
+                }
+              }
+            });
+
+            // Catch the close event and tell the user the connection in closed between the user and
+            // the live agent
+            ws.on("close", (code, reason) => {
+              console.log(`WebSocket closed with code: ${code}, reason: ${reason}`);
+              const embed = new EmbedBuilder()
+                .setAuthor({ name: 'Funding Pips Ticket support', iconURL: 'https://s3-eu-west-1.amazonaws.com/tpd/logos/634a4940f5023fc9ea219434/0x0.png', url: 'https://fundingpips.com/' })
+                .setTitle("Intercom agent closed conversation")
+
+                .setDescription("This ticket will be closed automatically after 30 seconds")
+                .setColor("#334AFA");
+
+              message.channel.send({ embeds: [embed] });
+              websocketStore.delete(message.channel.id);
+
+
+              setTimeout(() => {
+                const fetchedChannel = message.guild.channels.cache.get(message.channel.id);
+                fetchedChannel.delete();
+              }, 30000)
+
+            });
+
+            // Catch errors in the wesocket
+            ws.on("error", (error) => {
+              console.error("WebSocket error:", error);
+              message.channel.send("An error occurred with the live chat connection. Please try again later.");
+              ws.close(); // Optionally close the WebSocket if an error occurs
+            });
+
+            // Catch initial connection errors
+            ws.onerror = (error) => {
+              console.error("WebSocket initial connection error:", error);
+            };
+          })
+          .catch((error) => {
+            console.error("Error starting conversation with Intercom: ", error);
+            message.channel.send("There was an error connecting to Intercom.");
+          });
+      } else {
+        const embed = new EmbedBuilder()
+          .setTitle("Support")
+          .setDescription("You can only start a conversation with Intercom within a ticket channel.")
+          .setColor("#ff0000");
+        message.channel.send({ embeds: [embed] });
+      }
+    })
+    .catch((error) => {
+      console.error("Error checking ticket channel: ", error);
+      message.channel.send("There was an error processing your request.");
+    });
+};
+
+const getVoiceflowMessageResponse = (messageWithoutMention, message) => {
+  console.log(messageWithoutMention);
+  return new Promise((resolve, reject) => {
+    const requestBody = {
+      action: {
+        type: "text",
+        payload: messageWithoutMention,
+      },
+      config: {
+        tts: false,
+        stripSSML: true,
+        stopAll: true,
+        excludeTypes: ["path", "debug", "flow", "block", "end"],
+      },
+    };
+    // Create the new user
+    axios
+      .post(`https://general-runtime.voiceflow.com/state/user/${message.author.id}/interact`, requestBody, {
+        headers: {
+          Authorization: process.env.VOICEFLOW_API_KEY,
+          "Content-Type": "application/json",
+        },
+      })
+      .then((res) => {
+
+        /* console.log("res data:")
+console.log(res.data); */
+
+        /*  console.log("resolve:") */
+        resolve(res.data);
+      })
+      .catch((err) => {
+        console.log(err);
+        reject(err);
+      });
+  });
+};
+
+const messageCreateHandler = {
+  name: Events.MessageCreate,
+  async execute(message) {
+
+    if (message.content.includes("I am Funding Pips AI assistant")) {
+      setChannelTimer(message.channel.id, message.guild, 5);
+      console.log(message.channel.id)
+    }
+
+    if (message.author.bot) return;
+
+    const newob = JSON.stringify(message.member);
+    const userRoles = JSON.parse(newob).roles
+
+    const moderatorRoles = ["99", "12233333"];
+
+    // If the user who wrote the message has a mod role, we return
+    // since the bot should not respond to a mod
+    if (userRoles.some(item => moderatorRoles.includes(item))) {
+      return;
+    }
+
+    // If a WebSocket connection exists for this channel, forward the message
+    if (websocketStore.has(message.channel.id)) {
+      const ws = websocketStore.get(message.channel.id);
+      // Send a JSON string with the message type and content
+
+      let attachmentUrls = Array.from(message.attachments.values()).map((attachment) => attachment.url);
+      console.log(attachmentUrls);
+
+      if (attachmentUrls.length <= 5) {
+
+        if (message.attachments) {
+          ws.send(JSON.stringify({ type: "user.message", data: { message: message.content, attachmentUrls } }));
+        } else {
+          ws.send(JSON.stringify({ type: "user.message", data: { message: message.content } }));
+        }
+      } else {
+        if (message.content) {
+          message.channel.send("Cannot send over 5 attachments at a time")
+          ws.send(JSON.stringify({ type: "user.message", data: { message: message.content } }));
+        } else {
+          message.channel.send("Cannot send over 5 attachments at a time")
+        }
+      }
+
+    } else {
+      // Only respond with ai answer if the question is asked in the specified channel, or if
+      // the channel name starts with "ticket"
+      if (message.channel.name.startsWith("ticket")) {
+        // If there is no WebSocket connection, process the message normally
+        console.log("===========")
+        setChannelTimer(message.channel.id, message.guild, 5);
+
+        console.log("User message:", message.content);
+       
+        let liveAnswer = message;
+        liveAnswer.isLive = true;
+        const messageWithoutMention = message.content.replace(/^<@\!?(\d+)>/, "").trim();
+
+        console.log("=====");
+
+        /* if (process.env.LIVEANSWERS_CHANNELS.includes(message.channel.id)) {
+          console.log("QNA channel triggered");
+          // Send the user question to voiceflow
+          await interact(liveAnswer, message.author.id, false, false, true, messageWithoutMention);
+        } */
+
+        console.log("Starts with ticket");
+        console.log("Check if user exists")
+        
+        axios
+          .get(`https://general-runtime.voiceflow.com/state/user/${message.author.id}`, {
+            params: {
+              versionID: "production",
+            },
+            headers: {
+              Authorization: process.env.VOICEFLOW_API_KEY,
+            },
+          })
+          .then((response) => {
+´            // If a the userID does not exist in voiceflow, create a new user
+            if (Object.keys(response.data).length === 0) {
+              console.log("USer does not exist")
+              const requestBody = {
+                versionID: "production",
+                action: {
+                  type: "launch",
+                },
+              };
+              // Create the new user
+              axios
+                .post(`https://general-runtime.voiceflow.com/state/user/${message.author.id}`, requestBody, {
+                  headers: {
+                    Authorization: process.env.VOICEFLOW_API_KEY,
+                    "Content-Type": "application/json",
+                  },
+                })
+                .then((res) => {
+                  getVoiceflowMessageResponse(messageWithoutMention, message).then((res) => {
+                    /* console.log(res);
+
+                    if (res[1]?.type === "end") {
+                      channel.message.send("I cant answer that");
+                    }
+
+                    if (res[2]?.type === "talk_to_agent") {
+                      talkToHuman(message);
+                    } else {
+                      console.log("ANSWER2");
+                      console.log(res[1]?.payload?.message);
+
+                      if (!res[1]?.payload?.message) {
+                        getVoiceflowMessageResponse(messageWithoutMention, message).then((res) => {
+                          if (res[2]?.type === "talk_to_agent") {
+                            talkToHuman(message);
+                          } else {
+                            console.log("ANSWER2");
+                            console.log(res[1]?.payload?.message);
+
+                            if (!res[1]?.payload?.message) {
+                              message.channel.send(
+                                "I couldn't find an answer to that. Could you reask that in a different way? Or if you need a real person to step in, just let me know!"
+                              );
+                              //talkToHuman(message);
+                            } else {
+                              message.channel.send(res[1]?.payload?.message);
+                            }
+                          }
+                        });
+                      } else {
+                        message.channel.send(res[1]?.payload?.message);
+                      }
+                    } */
+
+                    console.log(res)
+
+                    if (res[1]?.type === "end") {
+                      channel.message.send("I cant answer that");
+                    }
+
+                    if (res[0]?.type === "talk_to_agent") {
+                      talkToHuman(message);
+                    }
+
+                    res.map((item) => {
+
+                      if (item?.payload?.message) {
+                        message.channel.send(item.payload.message);
+                      }
+                    })
+                  });
+                })
+                .catch((err) => {
+                  console.error(err);
+                });
+            } else {
+
+              console.log("user exists")
+
+              getVoiceflowMessageResponse(messageWithoutMention, message).then((res) => {
+
+                console.log(res)
+
+                if (res[1]?.type === "end") {
+                  channel.message.send("I cant answer that");
+                }
+
+                if (res[0]?.type === "talk_to_agent") {
+                  talkToHuman(message);
+                }
+
+                res.map((item) => {
+
+                  if (item?.payload?.message) {
+                    message.channel.send(item.payload.message);
+                  }
+                })
+
+                /* if (res[2]?.type === "talk_to_agent") {
+                  talkToHuman(message);
+                } else {
+                  if (!res[1]?.payload?.message) {
+                    getVoiceflowMessageResponse(messageWithoutMention, message).then((res) => {
+                      if (res[2]?.type === "talk_to_agent") {
+                        talkToHuman(message);
+                      } else {
+                        if (!res[1]?.payload?.message) {
+                          message.channel.send(
+                            "I couldn't find an answer to that. Could you reask that in a different way? Or if you need a real person to step in, just let me know!"
+                          );
+                          //talkToHuman(message);
+                        } else {
+                          message.channel.send(res[1]?.payload?.message);
+                        }
+                      }
+                    });
+                  } else {
+                    message.channel.send(res[1]?.payload?.message);
+                  }
+                } */
+              });
+            }
+          })
+          .catch((error) => {
+            console.error(error);
+          });
+      }
+    }
+  },
+};
+
+export default messageCreateHandler;
