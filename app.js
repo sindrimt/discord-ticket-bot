@@ -7,8 +7,20 @@ import { fileURLToPath } from "url";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
 
 import pkg from "discord.js";
+import express from "express";
 
 const { Events, EmbedBuilder } = pkg;
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get("/healthz", (req, res) => {
+    if (client.isReady()) {
+        res.status(200).send("OK");
+    } else {
+        res.status(503).send("Service Unavailable");
+    }
+});
 
 const { DISCORD_TOKEN } = process.env;
 import axios from "axios";
@@ -120,5 +132,9 @@ async function main() {
         console.error("This was the error msg");
     }
 }
+
+app.listen(PORT, () => {
+    console.log(`Health check server listening on port ${PORT}`);
+});
 
 main();
